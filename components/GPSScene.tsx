@@ -18,6 +18,8 @@ const PLACEMENT_DISTANCE = 5; // metres in front of user
 export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
   const mountRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const modelRef = useRef<THREE.Group | null>(null);
@@ -28,6 +30,7 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
   const { position } = useGeolocation();
   const { orientation, permissionGranted, requestPermission } = useDeviceOrientation();
   const [needsPermission, setNeedsPermission] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
 
   // ── Touch interaction state ──────────────────────────────────
   const touchState = useRef({
@@ -163,14 +166,60 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     return () => { cleanup.then((fn) => fn?.()); };
   }, [init]);
 
+  // ── Back-camera feed (getUserMedia) ──────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+
+    const start = async () => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setCameraError("Camera API not available");
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false,
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        streamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          // play() needs to be awaited on iOS; ignore AbortError on unmount.
+          videoRef.current.play().catch(() => {});
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Camera blocked";
+        setCameraError(msg);
+      }
+    };
+    start();
+
+    return () => {
+      cancelled = true;
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    };
+  }, []);
+
   return (
     <div
       ref={mountRef}
-      className="relative w-full h-dvh"
+      className="relative w-full h-dvh bg-black"
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}
       onTouchEnd={onTouchEnd}
     >
+      {/* Live back-camera feed — sits behind the transparent Three.js canvas */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        className="absolute inset-0 w-full h-full object-cover"
+      />
       <canvas ref={canvasRef} className="absolute inset-0" />
 
       {/* Crosshair centre indicator */}
@@ -197,7 +246,10 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
       )}
 
       {/* Status bar */}
-      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 text-center text-xs text-white/60 pointer-events-none space-y-1">
+      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 text-center text-xs text-white/70 pointer-events-none space-y-1">
+        {cameraError && (
+          <p className="text-red-300/90">Camera: {cameraError}</p>
+        )}
         {position ? (
           <p>GPS locked · {position.accuracy.toFixed(0)} m accuracy</p>
         ) : (
