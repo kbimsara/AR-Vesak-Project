@@ -1,8 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import * as THREE from "three";
-import { ARButton } from "three/examples/jsm/webxr/ARButton.js";
 import { createRenderer } from "@/lib/three/createRenderer";
 import { createReticle } from "@/lib/three/createReticle";
 import { loadModel } from "@/lib/three/loadModel";
@@ -10,28 +9,30 @@ import { loadModel } from "@/lib/three/loadModel";
 interface ARSceneProps {
   modelUrl: string;
   onReady?: () => void;
+  /** Fired when WebXR claims support but `requestSession` actually fails. */
+  onUnsupported?: (reason: string) => void;
 }
 
-export default function ARScene({ modelUrl, onReady }: ARSceneProps) {
+export default function ARScene({ modelUrl, onReady, onUnsupported }: ARSceneProps) {
   const mountRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+
+  const [sessionState, setSessionState] = useState<"idle" | "starting" | "running">("idle");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const cleanup = useRef<(() => void) | null>(null);
 
   const init = useCallback(async () => {
     if (!mountRef.current || !canvasRef.current) return;
 
-    // ── Scene ───────────────────────────────────────────────────
     const scene = new THREE.Scene();
-
-    // ── Lighting ────────────────────────────────────────────────
     scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1));
     const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
     dirLight.position.set(1, 3, 2);
     dirLight.castShadow = true;
     scene.add(dirLight);
 
-    // ── Camera ──────────────────────────────────────────────────
     const camera = new THREE.PerspectiveCamera(
       70,
       window.innerWidth / window.innerHeight,
@@ -39,47 +40,30 @@ export default function ARScene({ modelUrl, onReady }: ARSceneProps) {
       20
     );
 
-    // ── Renderer ────────────────────────────────────────────────
     const renderer = createRenderer(canvasRef.current);
     renderer.xr.enabled = true;
+    rendererRef.current = renderer;
 
-    // AR button — appended to the overlay div, not document.body
-    const arButton = ARButton.createButton(renderer, {
-      requiredFeatures: ["hit-test"],
-      optionalFeatures: ["dom-overlay"],
-      domOverlay: { root: mountRef.current },
-    });
-    arButton.id = "ar-button";
-    mountRef.current.appendChild(arButton);
-
-    // ── Reticle ──────────────────────────────────────────────────
     const reticle = createReticle();
     scene.add(reticle);
 
-    // ── Load model ───────────────────────────────────────────────
     const modelTemplate = await loadModel(modelUrl);
     onReady?.();
 
-    // ── Hit-test source ──────────────────────────────────────────
     let hitTestSource: XRHitTestSource | null = null;
     let hitTestSourceRequested = false;
 
-    // ── Controller (tap) ─────────────────────────────────────────
     const controller = renderer.xr.getController(0);
     controller.addEventListener("select", () => {
       if (!reticle.visible) return;
-
-      // Clone the model and place at reticle pose
       const model = modelTemplate.clone();
       model.position.setFromMatrixPosition(reticle.matrix);
       model.quaternion.setFromRotationMatrix(reticle.matrix);
-      // Lift slightly so it sits on the surface
       model.position.y += 0.01;
       scene.add(model);
     });
     scene.add(controller);
 
-    // ── Resize ───────────────────────────────────────────────────
     const onResize = () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
@@ -87,9 +71,7 @@ export default function ARScene({ modelUrl, onReady }: ARSceneProps) {
     };
     window.addEventListener("resize", onResize);
 
-    // ── Animation loop ───────────────────────────────────────────
     renderer.setAnimationLoop(async (_, frame) => {
-      // Rotate all placed models for visual interest
       scene.children.forEach((child) => {
         if (child !== reticle && child !== controller && child.type === "Group") {
           child.rotation.y += 0.005;
@@ -100,22 +82,25 @@ export default function ARScene({ modelUrl, onReady }: ARSceneProps) {
         const session = renderer.xr.getSession()!;
         const referenceSpace = renderer.xr.getReferenceSpace()!;
 
-        // Request hit-test source once per session
         if (!hitTestSourceRequested) {
           hitTestSourceRequested = true;
-          const viewerSpace = await session.requestReferenceSpace("viewer");
-          if (session.requestHitTestSource) {
-            const src = await session.requestHitTestSource({ space: viewerSpace });
-            hitTestSource = src ?? null;
+          try {
+            const viewerSpace = await session.requestReferenceSpace("viewer");
+            if (session.requestHitTestSource) {
+              const src = await session.requestHitTestSource({ space: viewerSpace });
+              hitTestSource = src ?? null;
+            }
+          } catch {
+            // hit-test unavailable — reticle just won't show
           }
 
           session.addEventListener("end", () => {
             hitTestSourceRequested = false;
             hitTestSource = null;
+            setSessionState("idle");
           });
         }
 
-        // Update reticle from hit results
         if (hitTestSource) {
           const results = frame.getHitTestResults(hitTestSource);
           if (results.length > 0) {
@@ -139,7 +124,7 @@ export default function ARScene({ modelUrl, onReady }: ARSceneProps) {
       renderer.xr.getSession()?.end().catch(() => {});
       renderer.dispose();
       window.removeEventListener("resize", onResize);
-      if (arButton.parentNode) arButton.parentNode.removeChild(arButton);
+      rendererRef.current = null;
     };
   }, [modelUrl, onReady]);
 
@@ -148,13 +133,57 @@ export default function ARScene({ modelUrl, onReady }: ARSceneProps) {
     return () => cleanup.current?.();
   }, [init]);
 
+  const handleStartAR = useCallback(async () => {
+    const renderer = rendererRef.current;
+    if (!renderer || !navigator.xr) return;
+
+    setSessionState("starting");
+    setErrorMessage(null);
+
+    try {
+      const session = await navigator.xr.requestSession("immersive-ar", {
+        requiredFeatures: ["hit-test"],
+        optionalFeatures: ["dom-overlay"],
+        domOverlay: mountRef.current ? { root: mountRef.current } : undefined,
+      } as XRSessionInit);
+
+      await renderer.xr.setSession(session as XRSession);
+      setSessionState("running");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      setErrorMessage(msg);
+      setSessionState("idle");
+      // Real-device failure (e.g. Redmi without ARCore) — bubble up so the
+      // app can switch to GPS mode automatically.
+      onUnsupported?.(msg);
+    }
+  }, [onUnsupported]);
+
   return (
     <div ref={mountRef} className="relative w-full h-dvh">
       <canvas ref={canvasRef} className="absolute inset-0" />
-      {/* Overlay hint */}
-      <p className="absolute bottom-24 left-1/2 -translate-x-1/2 text-center text-sm text-white/70 pointer-events-none">
-        Point at a surface and tap to place the lantern
-      </p>
+
+      {sessionState !== "running" && (
+        <div className="absolute inset-x-0 bottom-10 flex flex-col items-center gap-4 z-10">
+          <p className="text-center text-sm text-white/70 px-6">
+            Point at a surface and tap to place the lantern
+          </p>
+
+          <button
+            onClick={handleStartAR}
+            disabled={sessionState === "starting"}
+            className="px-8 py-3 rounded-full bg-white text-black font-medium text-sm tracking-wide shadow-lg active:scale-95 transition disabled:opacity-50"
+          >
+            {sessionState === "starting" ? "Starting…" : "START AR"}
+          </button>
+
+          {errorMessage && (
+            <p className="text-xs text-red-300/80 px-6 text-center max-w-xs">
+              AR failed to start: {errorMessage}. Falling back to GPS mode…
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }

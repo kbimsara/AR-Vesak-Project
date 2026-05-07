@@ -17,11 +17,15 @@ const USDZ_URL = "/models/lantern.usdz";
 export default function Home() {
   const xrSupport = useXRSupport();
   const [modelReady, setModelReady] = useState(false);
+  // Some Android devices (e.g. Redmi without ARCore) report `immersive-ar` as
+  // supported but fail when `requestSession` is actually called. When that
+  // happens the AR scene calls `onUnsupported` and we force GPS mode.
+  const [arRuntimeFailed, setArRuntimeFailed] = useState(false);
 
   const isChecking = xrSupport === "checking";
-  const isWebXR = xrSupport === "supported";
+  const isWebXR = xrSupport === "supported" && !arRuntimeFailed;
   const isIOSAR = xrSupport === "ios-quicklook";
-  const isGPS = xrSupport === "unsupported";
+  const isGPS = xrSupport === "unsupported" || arRuntimeFailed;
 
   const loadingMessage = isChecking
     ? "Checking AR support…"
@@ -45,7 +49,14 @@ export default function Home() {
 
       {/* WebXR scene — Android Chrome */}
       {!isChecking && isWebXR && (
-        <ARScene modelUrl={MODEL_URL} onReady={() => setModelReady(true)} />
+        <ARScene
+          modelUrl={MODEL_URL}
+          onReady={() => setModelReady(true)}
+          onUnsupported={() => {
+            setModelReady(false);
+            setArRuntimeFailed(true);
+          }}
+        />
       )}
 
       {/* iOS AR Quick Look — iPhone / iPad */}
