@@ -13,7 +13,9 @@ interface GPSSceneProps {
   onReady?: () => void;
 }
 
-const PLACEMENT_DISTANCE = 5; // metres in front of user
+const PLACEMENT_DISTANCE = 2.5; // metres in front of user
+const EYE_HEIGHT = 1.6;
+const LANTERN_HEIGHT = 1.2; // place around chest/face level so it's centred
 
 export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -58,15 +60,20 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
       0.01,
       1000
     );
-    camera.position.set(0, 1.6, 0); // eye height
+    camera.position.set(0, EYE_HEIGHT, 0); // eye height
     cameraRef.current = camera;
 
     const renderer = createRenderer(canvasRef.current);
+    renderer.setClearAlpha(0); // ensure camera-feed video shows through
     rendererRef.current = renderer;
 
     // Load model
     const model = await loadModel(modelUrl);
+    // Bump up so the 0.4 m bbox lantern is comfortably visible at 2.5 m
+    model.scale.multiplyScalar(2.5);
     modelRef.current = model;
+    // Place immediately, eye-level, straight ahead — visible even before GPS
+    model.position.set(0, LANTERN_HEIGHT, -PLACEMENT_DISTANCE);
     scene.add(model);
     onReady?.();
 
@@ -118,12 +125,13 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     cameraRef.current.quaternion.setFromEuler(euler);
   }, [orientation, permissionGranted]);
 
-  // Place model once we have GPS + heading
+  // Re-place model on the compass heading once we have GPS + heading
   useEffect(() => {
     if (!modelRef.current || placedRef.current || !position) return;
     placedRef.current = true;
 
     const offset = forwardOffset(orientation.alpha, PLACEMENT_DISTANCE);
+    offset.y = LANTERN_HEIGHT;
     modelRef.current.position.copy(offset);
   }, [position, orientation.alpha]);
 
