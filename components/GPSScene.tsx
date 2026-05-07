@@ -111,18 +111,36 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     }
   }, [permissionGranted]);
 
-  // Apply device orientation to camera
+  // Apply device orientation to camera (matches three.js DeviceOrientationControls)
   useEffect(() => {
     if (!cameraRef.current || !permissionGranted) return;
 
     const { alpha, beta, gamma } = orientation;
+
+    // Screen orientation in radians (rotate 0/90/-90/180 depending on device)
+    const screenAngle =
+      typeof window !== "undefined"
+        ? ((window.screen.orientation?.angle ?? 0) * Math.PI) / 180
+        : 0;
+
     const euler = new THREE.Euler(
       THREE.MathUtils.degToRad(beta),
       THREE.MathUtils.degToRad(alpha),
       THREE.MathUtils.degToRad(-gamma),
       "YXZ"
     );
-    cameraRef.current.quaternion.setFromEuler(euler);
+
+    const q = new THREE.Quaternion().setFromEuler(euler);
+    // Camera looks out the back of the device, not "up" through the screen
+    q.multiply(new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)));
+    // Account for the user holding the phone in portrait/landscape
+    const screenCorr = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(0, 0, 1),
+      -screenAngle
+    );
+    q.multiply(screenCorr);
+
+    cameraRef.current.quaternion.copy(q);
   }, [orientation, permissionGranted]);
 
   // Re-place model on the compass heading once we have GPS + heading
