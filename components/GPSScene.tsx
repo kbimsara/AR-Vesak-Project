@@ -13,7 +13,8 @@ interface GPSSceneProps {
 
 const PLACEMENT_DISTANCE = 20;
 const EYE_HEIGHT = 1.6;
-const MODEL_SCALE = 1;
+const LANTERN_HEIGHT = 1.5; // world-space Y where the lantern is always placed
+const MODEL_SCALE = 4;     // visible at 20 m (normalised model is 0.4 m)
 
 export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -41,12 +42,25 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     moved: false,
   });
 
-  // World position directly ahead of the camera center at PLACEMENT_DISTANCE
+  // Horizontal world position PLACEMENT_DISTANCE ahead of the camera.
+  // We strip the vertical component so phone tilt never sends the lantern
+  // underground or into the sky — only left/right rotation matters.
   const crosshairWorldPos = useCallback((): THREE.Vector3 => {
     const cam = cameraRef.current;
-    if (!cam) return new THREE.Vector3(0, EYE_HEIGHT, -PLACEMENT_DISTANCE);
-    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
-    return cam.position.clone().addScaledVector(dir, PLACEMENT_DISTANCE);
+    if (!cam) return new THREE.Vector3(0, LANTERN_HEIGHT, -PLACEMENT_DISTANCE);
+
+    const look = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+    const hDir = new THREE.Vector3(look.x, 0, look.z);
+
+    // If pointing nearly straight up/down, fall back to world -Z
+    if (hDir.lengthSq() < 0.01) hDir.set(0, 0, -1);
+    else hDir.normalize();
+
+    return new THREE.Vector3(
+      cam.position.x + hDir.x * PLACEMENT_DISTANCE,
+      LANTERN_HEIGHT,
+      cam.position.z + hDir.z * PLACEMENT_DISTANCE
+    );
   }, []);
 
   // Make every mesh in a group semi-transparent
