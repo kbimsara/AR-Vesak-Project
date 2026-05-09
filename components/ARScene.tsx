@@ -48,11 +48,11 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
 
   const { model: modelTemplate, mixer, error: modelError } = useGLTFLoader(modelUrl);
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
+  // Ref so the select handler always reads the latest model without being in init's deps
+  const modelTemplateRef = useRef<THREE.Group | null>(null);
 
-  // Keep mixerRef in sync so the render loop always sees the latest mixer
-  useEffect(() => {
-    mixerRef.current = mixer;
-  }, [mixer]);
+  useEffect(() => { mixerRef.current = mixer; }, [mixer]);
+  useEffect(() => { modelTemplateRef.current = modelTemplate; }, [modelTemplate]);
 
   // Signal ready once model loads (or errors)
   useEffect(() => {
@@ -91,7 +91,7 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     const controller = renderer.xr.getController(0);
     controller.addEventListener("select", () => {
       if (!reticle.visible) return;
-      const template = modelTemplate;
+      const template = modelTemplateRef.current;
       if (!template) return;
 
       // Single-placement: move template to reticle position (no clone needed)
@@ -189,7 +189,8 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
       window.removeEventListener("resize", onResize);
       rendererRef.current = null;
     };
-  }, [modelTemplate]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     init();
