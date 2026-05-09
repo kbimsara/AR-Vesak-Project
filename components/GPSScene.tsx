@@ -11,12 +11,12 @@ interface GPSSceneProps {
   onReady?: () => void;
 }
 
-const PLACEMENT_DISTANCE = 20;
+const MAX_PLACEMENT_DISTANCE = 20; // ray cap when not hitting the ground
+const MIN_PLACEMENT_DISTANCE = 0.8;
 const EYE_HEIGHT = 1.6;
-const LANTERN_HEIGHT = 1.5;
-// Auto-scale: model appears the same apparent size regardless of distance.
-// loadModel normalises to 0.4 m; factor 0.2 gives ~1.6° apparent height at any distance.
-const autoScale = (dist: number) => dist * 0.2;
+// Apparent-size scale: keeps the lantern visually the same size at any distance.
+// loadModel normalises to 0.4 m; factor 0.2 gives ~6° apparent height.
+const autoScale = (dist: number) => Math.max(0.5, dist * 0.2);
 
 export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -46,22 +46,28 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     moved: false,
   });
 
-  // Horizontal world position PLACEMENT_DISTANCE ahead of the camera.
-  // Strips vertical tilt so the lantern never spawns underground or in the sky.
+  // Where the user is actually pointing.
+  // Cast a ray from the camera along the look direction:
+  //   • If it hits the ground plane (y=0), drop the lantern there.
+  //   • Otherwise place it at MAX_PLACEMENT_DISTANCE along the ray.
+  // This makes tilting the phone down/up move the placement closer/further,
+  // matching what the crosshair is over.
   const crosshairWorldPos = useCallback((): THREE.Vector3 => {
     const cam = cameraRef.current;
-    if (!cam) return new THREE.Vector3(0, LANTERN_HEIGHT, -PLACEMENT_DISTANCE);
+    if (!cam) return new THREE.Vector3(0, 0, -MAX_PLACEMENT_DISTANCE);
 
-    const look = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
-    const hDir = new THREE.Vector3(look.x, 0, look.z);
-    if (hDir.lengthSq() < 0.01) hDir.set(0, 0, -1);
-    else hDir.normalize();
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+    let dist = MAX_PLACEMENT_DISTANCE;
 
-    return new THREE.Vector3(
-      cam.position.x + hDir.x * PLACEMENT_DISTANCE,
-      LANTERN_HEIGHT,
-      cam.position.z + hDir.z * PLACEMENT_DISTANCE
-    );
+    // Pointing downward → intersect ground plane (y=0)
+    if (dir.y < -0.02) {
+      const groundDist = -cam.position.y / dir.y;
+      if (groundDist > 0) dist = Math.min(dist, groundDist);
+    }
+    // Don't let it spawn right on the lens
+    dist = Math.max(MIN_PLACEMENT_DISTANCE, dist);
+
+    return cam.position.clone().addScaledVector(dir, dist);
   }, []);
 
   const applyGhostMaterial = (group: THREE.Group) => {
@@ -103,7 +109,7 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     rendererRef.current = renderer;
 
     const ghost = await loadModel(modelUrl);
-    ghost.scale.setScalar(autoScale(PLACEMENT_DISTANCE));
+    ghost.scale.setScalar(autoScale(MAX_PLACEMENT_DISTANCE));
     applyGhostMaterial(ghost);
     ghostRef.current = ghost;
     scene.add(ghost);
@@ -121,8 +127,11 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     const animate = () => {
       rafRef.current = requestAnimationFrame(animate);
 
-      if (ghostRef.current) {
-        ghostRef.current.position.copy(crosshairWorldPos());
+      if (ghostRef.current && cameraRef.current) {
+        const pos = crosshairWorldPos();
+        ghostRef.current.position.copy(pos);
+        const d = pos.distanceTo(cameraRef.current.position);
+        ghostRef.current.scale.setScalar(autoScale(d));
         ghostRotY += 0.004;
         ghostRef.current.rotation.y = ghostRotY;
       }
@@ -177,8 +186,9 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     const pos = crosshairWorldPos();
     const model = await loadModel(modelUrl);
 
-    // Auto-size: consistent apparent size at any placement distance
-    model.scale.setScalar(autoScale(PLACEMENT_DISTANCE));
+    // Auto-size: scale by actual distance from camera to the hit point
+    const dist = pos.distanceTo(camera.position);
+    model.scale.setScalar(autoScale(dist));
     model.position.copy(pos);
 
     // Face model toward the camera on the horizontal plane

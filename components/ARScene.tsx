@@ -13,13 +13,21 @@ interface ARSceneProps {
   onUnsupported?: (reason: string) => void;
 }
 
+// Real-world height the placed lantern should appear (metres).
+// loadModel normalises the model to a 0.4 m bounding box, so a scale of
+// 4 puts it at ~1.6 m — chest/head height in a real room.
+const PLACED_SCALE = 4;
+
 export default function ARScene({ modelUrl, onReady, onUnsupported }: ARSceneProps) {
   const mountRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const placedListRef = useRef<THREE.Group[]>([]);
 
   const [sessionState, setSessionState] = useState<"idle" | "starting" | "running">("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [placedCount, setPlacedCount] = useState(0);
 
   const cleanup = useRef<(() => void) | null>(null);
 
@@ -27,6 +35,7 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     if (!mountRef.current || !canvasRef.current) return;
 
     const scene = new THREE.Scene();
+    sceneRef.current = scene;
     scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1));
     const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
     dirLight.position.set(1, 3, 2);
@@ -56,11 +65,27 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     const controller = renderer.xr.getController(0);
     controller.addEventListener("select", () => {
       if (!reticle.visible) return;
+
       const model = modelTemplate.clone();
-      model.position.setFromMatrixPosition(reticle.matrix);
-      model.quaternion.setFromRotationMatrix(reticle.matrix);
-      model.position.y += 0.01;
+      model.scale.setScalar(PLACED_SCALE);
+
+      // Position from reticle, but keep upright (don't copy rotation so the
+      // lantern always stands vertically regardless of surface orientation)
+      const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+      model.position.copy(pos);
+
+      // Face the camera on the horizontal plane
+      const camPos = new THREE.Vector3();
+      camera.getWorldPosition(camPos);
+      const toCam = new THREE.Vector3().subVectors(camPos, pos).setY(0);
+      if (toCam.lengthSq() > 1e-6) {
+        toCam.normalize();
+        model.rotation.y = Math.atan2(toCam.x, toCam.z);
+      }
+
       scene.add(model);
+      placedListRef.current.push(model);
+      setPlacedCount((n) => n + 1);
     });
     scene.add(controller);
 
@@ -72,11 +97,8 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     window.addEventListener("resize", onResize);
 
     renderer.setAnimationLoop(async (_, frame) => {
-      scene.children.forEach((child) => {
-        if (child !== reticle && child !== controller && child.type === "Group") {
-          child.rotation.y += 0.005;
-        }
-      });
+      // Idle rotation only on placed lanterns
+      for (const m of placedListRef.current) m.rotation.y += 0.005;
 
       if (frame) {
         const session = renderer.xr.getSession()!;
@@ -153,16 +175,47 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
       const msg = err instanceof Error ? err.message : "Unknown error";
       setErrorMessage(msg);
       setSessionState("idle");
-      // Real-device failure (e.g. Redmi without ARCore) — bubble up so the
-      // app can switch to GPS mode automatically.
       onUnsupported?.(msg);
     }
   }, [onUnsupported]);
+
+  const clearAll = useCallback(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    for (const m of placedListRef.current) scene.remove(m);
+    placedListRef.current = [];
+    setPlacedCount(0);
+  }, []);
 
   return (
     <div ref={mountRef} className="relative w-full h-dvh">
       <canvas ref={canvasRef} className="absolute inset-0" />
 
+      {/* In-AR overlay (visible during the immersive session) */}
+      {sessionState === "running" && (
+        <>
+          {placedCount > 0 && (
+            <div className="absolute top-6 left-5 bg-black/40 backdrop-blur border border-white/20 text-white text-xs px-3 py-1.5 rounded-full z-10 pointer-events-none">
+              🏮 {placedCount}
+            </div>
+          )}
+          {placedCount > 0 && (
+            <button
+              onClick={clearAll}
+              className="absolute top-6 right-5 bg-black/40 backdrop-blur border border-white/20 text-white text-xs px-4 py-2 rounded-full z-10"
+            >
+              Clear all
+            </button>
+          )}
+          <div className="absolute bottom-8 left-1/2 -translate-x-1/2 text-center text-xs text-white/80 pointer-events-none">
+            {placedCount === 0
+              ? "Move your phone to scan a surface, then tap to place"
+              : "Tap again to add more lanterns"}
+          </div>
+        </>
+      )}
+
+      {/* Pre-AR launcher */}
       {sessionState !== "running" && (
         <div className="absolute inset-x-0 bottom-10 flex flex-col items-center gap-4 z-10">
           <p className="text-center text-sm text-white/70 px-6">
