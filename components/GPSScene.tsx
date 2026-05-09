@@ -107,7 +107,7 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     rendererRef.current = renderer;
 
     // Template kept un-mutated so placeModel can clone synchronously
-    const template = await loadModel(modelUrl);
+    const { model: template } = await loadModel(modelUrl);
     templateRef.current = template;
 
     // Ghost preview = a separate clone with semi-transparent materials
