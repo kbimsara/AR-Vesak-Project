@@ -13,10 +13,12 @@ interface ARSceneProps {
   onUnsupported?: (reason: string) => void;
 }
 
-// Real-world height the placed lantern should appear (metres).
-// loadModel normalises the model to a 0.4 m bounding box, so a scale of
-// 4 puts it at ~1.6 m — chest/head height in a real room.
-const PLACED_SCALE = 4;
+// Real-world size the placed lantern should appear.
+// loadModel normalises to a 0.4 m bounding box. Scale 1 = 40 cm
+// (real Vesak-lantern sized). Adjustable in-AR via the size buttons.
+const DEFAULT_PLACED_SCALE = 1;
+const MIN_PLACED_SCALE = 0.25;
+const MAX_PLACED_SCALE = 4;
 
 export default function ARScene({ modelUrl, onReady, onUnsupported }: ARSceneProps) {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -28,6 +30,10 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
   const [sessionState, setSessionState] = useState<"idle" | "starting" | "running">("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [placedCount, setPlacedCount] = useState(0);
+  // Current size for newly placed lanterns. Kept in a ref too so the XR
+  // controller's `select` handler reads the latest value without re-binding.
+  const [placeScale, setPlaceScale] = useState(DEFAULT_PLACED_SCALE);
+  const placeScaleRef = useRef(DEFAULT_PLACED_SCALE);
 
   const cleanup = useRef<(() => void) | null>(null);
 
@@ -77,7 +83,7 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
       if (!reticle.visible) return;
 
       const model = modelTemplate.clone();
-      model.scale.setScalar(PLACED_SCALE);
+      model.scale.setScalar(placeScaleRef.current);
 
       // Position from reticle, but keep upright (don't copy rotation so the
       // lantern always stands vertically regardless of surface orientation)
@@ -210,6 +216,16 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     setPlacedCount(0);
   }, []);
 
+  // Update the chosen size; also resize the last-placed lantern live
+  // so users can dial it in without re-placing.
+  const updateScale = useCallback((next: number) => {
+    const clamped = Math.max(MIN_PLACED_SCALE, Math.min(MAX_PLACED_SCALE, next));
+    placeScaleRef.current = clamped;
+    setPlaceScale(clamped);
+    const last = placedListRef.current[placedListRef.current.length - 1];
+    if (last) last.scale.setScalar(clamped);
+  }, []);
+
   return (
     <div ref={mountRef} className="relative w-full h-dvh bg-black">
       {/* Canvas is non-interactive until AR starts so it can never eat the
@@ -237,10 +253,33 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
               Clear all
             </button>
           )}
+
+          {/* Size control — applies to the next placement AND resizes the
+              most recently placed lantern live. */}
+          <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-10 flex items-center gap-3 bg-black/40 backdrop-blur border border-white/20 rounded-full px-3 py-2">
+            <button
+              onClick={() => updateScale(placeScale / 1.4)}
+              className="w-8 h-8 rounded-full bg-white/15 text-white text-lg active:scale-95 transition flex items-center justify-center"
+              aria-label="Smaller"
+            >
+              −
+            </button>
+            <div className="text-white/80 text-[11px] tabular-nums w-20 text-center">
+              {(placeScale * 0.4).toFixed(2)} m
+            </div>
+            <button
+              onClick={() => updateScale(placeScale * 1.4)}
+              className="w-8 h-8 rounded-full bg-white/15 text-white text-lg active:scale-95 transition flex items-center justify-center"
+              aria-label="Bigger"
+            >
+              +
+            </button>
+          </div>
+
           <div className="absolute bottom-8 left-1/2 -translate-x-1/2 text-center text-xs text-white/80 pointer-events-none">
             {placedCount === 0
               ? "Move your phone to scan a surface, then tap to place"
-              : "Tap again to add more lanterns"}
+              : "Tap to add more · Use −/+ to resize"}
           </div>
         </>
       )}
