@@ -4,8 +4,6 @@ import { useEffect, useRef, useCallback, useState } from "react";
 import * as THREE from "three";
 import { createRenderer } from "@/lib/three/createRenderer";
 import { loadModel } from "@/lib/three/loadModel";
-import { forwardOffset } from "@/lib/geo/forwardOffset";
-import { useGeolocation } from "@/hooks/useGeolocation";
 import { useDeviceOrientation } from "@/hooks/useDeviceOrientation";
 
 interface GPSSceneProps {
@@ -13,34 +11,58 @@ interface GPSSceneProps {
   onReady?: () => void;
 }
 
-const PLACEMENT_DISTANCE = 2.5; // metres in front of user
+const PLACEMENT_DISTANCE = 2.5;
 const EYE_HEIGHT = 1.6;
-const LANTERN_HEIGHT = 1.2; // place around chest/face level so it's centred
+const MODEL_SCALE = 2.5;
 
 export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
-  const mountRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-  const modelRef = useRef<THREE.Group | null>(null);
+  const ghostRef = useRef<THREE.Group | null>(null);
+  const placedRef = useRef<THREE.Group | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const rafRef = useRef<number>(0);
-  const placedRef = useRef(false);
 
-  const { position } = useGeolocation();
+  const [placed, setPlaced] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
   const { orientation, permissionGranted, requestPermission } = useDeviceOrientation();
   const [needsPermission, setNeedsPermission] = useState(false);
-  const [cameraError, setCameraError] = useState<string | null>(null);
 
-  // ── Touch interaction state ──────────────────────────────────
-  const touchState = useRef({
+  const touch = useRef({
+    startX: 0,
+    startY: 0,
     lastX: 0,
     lastDist: 0,
     rotating: false,
     pinching: false,
+    moved: false,
   });
+
+  // World position directly ahead of the camera center at PLACEMENT_DISTANCE
+  const crosshairWorldPos = useCallback((): THREE.Vector3 => {
+    const cam = cameraRef.current;
+    if (!cam) return new THREE.Vector3(0, EYE_HEIGHT, -PLACEMENT_DISTANCE);
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+    return cam.position.clone().addScaledVector(dir, PLACEMENT_DISTANCE);
+  }, []);
+
+  // Make every mesh in a group semi-transparent
+  const applyGhostMaterial = (group: THREE.Group) => {
+    group.traverse((child) => {
+      if (!(child instanceof THREE.Mesh)) return;
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      child.material = mats.map((m: THREE.Material) => {
+        const c = m.clone() as THREE.MeshStandardMaterial;
+        c.transparent = true;
+        c.opacity = 0.45;
+        c.depthWrite = false;
+        return c;
+      });
+    });
+  };
 
   const init = useCallback(async () => {
     if (!canvasRef.current) return;
@@ -48,11 +70,10 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     const scene = new THREE.Scene();
     sceneRef.current = scene;
 
-    // Lighting
     scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
-    const dirLight = new THREE.DirectionalLight(0xc9a84c, 2);
-    dirLight.position.set(2, 5, 3);
-    scene.add(dirLight);
+    const dir = new THREE.DirectionalLight(0xc9a84c, 2);
+    dir.position.set(2, 5, 3);
+    scene.add(dir);
 
     const camera = new THREE.PerspectiveCamera(
       75,
@@ -60,24 +81,22 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
       0.01,
       1000
     );
-    camera.position.set(0, EYE_HEIGHT, 0); // eye height
+    camera.position.set(0, EYE_HEIGHT, 0);
     cameraRef.current = camera;
 
     const renderer = createRenderer(canvasRef.current);
-    renderer.setClearAlpha(0); // ensure camera-feed video shows through
+    renderer.setClearAlpha(0);
     rendererRef.current = renderer;
 
-    // Load model
-    const model = await loadModel(modelUrl);
-    // Bump up so the 0.4 m bbox lantern is comfortably visible at 2.5 m
-    model.scale.multiplyScalar(2.5);
-    modelRef.current = model;
-    // Place immediately, eye-level, straight ahead — visible even before GPS
-    model.position.set(0, LANTERN_HEIGHT, -PLACEMENT_DISTANCE);
-    scene.add(model);
+    // Ghost (preview) model
+    const ghost = await loadModel(modelUrl);
+    ghost.scale.setScalar(MODEL_SCALE);
+    applyGhostMaterial(ghost);
+    ghostRef.current = ghost;
+    scene.add(ghost);
+
     onReady?.();
 
-    // Resize handler
     const onResize = () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
@@ -85,11 +104,22 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     };
     window.addEventListener("resize", onResize);
 
-    // Animation loop
+    let ghostRotY = 0;
     const animate = () => {
       rafRef.current = requestAnimationFrame(animate);
-      // Slow idle rotation
-      if (modelRef.current) modelRef.current.rotation.y += 0.004;
+
+      // Ghost always tracks the crosshair
+      if (ghostRef.current) {
+        ghostRef.current.position.copy(crosshairWorldPos());
+        ghostRotY += 0.004;
+        ghostRef.current.rotation.y = ghostRotY;
+      }
+
+      // Placed model slow idle rotation
+      if (placedRef.current) {
+        placedRef.current.rotation.y += 0.004;
+      }
+
       renderer.render(scene, camera);
     };
     animate();
@@ -99,104 +129,151 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
       renderer.dispose();
       window.removeEventListener("resize", onResize);
     };
-  }, [modelUrl, onReady]);
+  }, [modelUrl, onReady, crosshairWorldPos]);
 
-  // Check if iOS permission is needed
-  useEffect(() => {
-    const DevOrEvent = DeviceOrientationEvent as unknown as {
-      requestPermission?: () => Promise<string>;
-    };
-    if (typeof DevOrEvent.requestPermission === "function" && !permissionGranted) {
-      setNeedsPermission(true);
-    }
-  }, [permissionGranted]);
-
-  // Apply device orientation to camera (matches three.js DeviceOrientationControls)
+  // Apply device orientation → camera quaternion
   useEffect(() => {
     if (!cameraRef.current || !permissionGranted) return;
-
     const { alpha, beta, gamma } = orientation;
-
-    // Screen orientation in radians (rotate 0/90/-90/180 depending on device)
-    const screenAngle =
-      typeof window !== "undefined"
-        ? ((window.screen.orientation?.angle ?? 0) * Math.PI) / 180
-        : 0;
-
+    const screenAngle = ((window.screen.orientation?.angle ?? 0) * Math.PI) / 180;
     const euler = new THREE.Euler(
       THREE.MathUtils.degToRad(beta),
       THREE.MathUtils.degToRad(alpha),
       THREE.MathUtils.degToRad(-gamma),
       "YXZ"
     );
-
     const q = new THREE.Quaternion().setFromEuler(euler);
-    // Camera looks out the back of the device, not "up" through the screen
     q.multiply(new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)));
-    // Account for the user holding the phone in portrait/landscape
-    const screenCorr = new THREE.Quaternion().setFromAxisAngle(
-      new THREE.Vector3(0, 0, 1),
-      -screenAngle
+    q.multiply(
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -screenAngle)
     );
-    q.multiply(screenCorr);
-
     cameraRef.current.quaternion.copy(q);
   }, [orientation, permissionGranted]);
 
-  // Re-place model on the compass heading once we have GPS + heading
+  // iOS motion permission gate
   useEffect(() => {
-    if (!modelRef.current || placedRef.current || !position) return;
-    placedRef.current = true;
+    const D = DeviceOrientationEvent as unknown as { requestPermission?: () => Promise<string> };
+    if (typeof D.requestPermission === "function" && !permissionGranted) {
+      setNeedsPermission(true);
+    }
+  }, [permissionGranted]);
 
-    const offset = forwardOffset(orientation.alpha, PLACEMENT_DISTANCE);
-    offset.y = LANTERN_HEIGHT;
-    modelRef.current.position.copy(offset);
-  }, [position, orientation.alpha]);
+  // Drop the model at the current crosshair position, facing the user
+  const placeModel = useCallback(async () => {
+    const scene = sceneRef.current;
+    const camera = cameraRef.current;
+    if (!scene || !camera) return;
 
-  // Touch: rotate (1 finger) & scale (2 finger pinch)
-  const onTouchStart = (e: React.TouchEvent) => {
+    const pos = crosshairWorldPos();
+
+    const model = await loadModel(modelUrl);
+    model.scale.setScalar(MODEL_SCALE);
+    model.position.copy(pos);
+
+    // Face the model toward the camera on the horizontal plane
+    const toCam = new THREE.Vector3()
+      .subVectors(camera.position, pos)
+      .setY(0)
+      .normalize();
+    model.rotation.y = Math.atan2(toCam.x, toCam.z);
+
+    if (placedRef.current) scene.remove(placedRef.current);
+    placedRef.current = model;
+    scene.add(model);
+
+    // Hide ghost while a model is placed
+    if (ghostRef.current) ghostRef.current.visible = false;
+
+    setPlaced(true);
+  }, [crosshairWorldPos, modelUrl]);
+
+  const resetPlacement = useCallback(() => {
+    const scene = sceneRef.current;
+    if (scene && placedRef.current) {
+      scene.remove(placedRef.current);
+      placedRef.current = null;
+    }
+    if (ghostRef.current) ghostRef.current.visible = true;
+    setPlaced(false);
+  }, []);
+
+  // Touch handlers
+  const onTouchStart = useCallback((e: React.TouchEvent) => {
     if (e.touches.length === 1) {
-      touchState.current.lastX = e.touches[0].clientX;
-      touchState.current.rotating = true;
+      touch.current.startX = e.touches[0].clientX;
+      touch.current.startY = e.touches[0].clientY;
+      touch.current.lastX = e.touches[0].clientX;
+      touch.current.rotating = true;
+      touch.current.pinching = false;
+      touch.current.moved = false;
     } else if (e.touches.length === 2) {
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
-      touchState.current.lastDist = Math.hypot(dx, dy);
-      touchState.current.pinching = true;
+      touch.current.lastDist = Math.hypot(dx, dy);
+      touch.current.pinching = true;
+      touch.current.rotating = false;
     }
-  };
-  const onTouchMove = (e: React.TouchEvent) => {
-    if (!modelRef.current) return;
-    if (touchState.current.rotating && e.touches.length === 1) {
-      const delta = e.touches[0].clientX - touchState.current.lastX;
-      modelRef.current.rotation.y += delta * 0.01;
-      touchState.current.lastX = e.touches[0].clientX;
-    }
-    if (touchState.current.pinching && e.touches.length === 2) {
-      const dx = e.touches[0].clientX - e.touches[1].clientX;
-      const dy = e.touches[0].clientY - e.touches[1].clientY;
-      const dist = Math.hypot(dx, dy);
-      const delta = dist / touchState.current.lastDist;
-      const current = modelRef.current.scale.x;
-      modelRef.current.scale.setScalar(THREE.MathUtils.clamp(current * delta, 0.1, 5));
-      touchState.current.lastDist = dist;
-    }
-  };
-  const onTouchEnd = () => {
-    touchState.current.rotating = false;
-    touchState.current.pinching = false;
-  };
+  }, []);
+
+  const onTouchMove = useCallback(
+    (e: React.TouchEvent) => {
+      if (touch.current.rotating && e.touches.length === 1) {
+        const dx = Math.abs(e.touches[0].clientX - touch.current.startX);
+        const dy = Math.abs(e.touches[0].clientY - touch.current.startY);
+        if (dx > 6 || dy > 6) touch.current.moved = true;
+
+        // Only rotate the placed model when one exists
+        if (placed && placedRef.current) {
+          placedRef.current.rotation.y +=
+            (e.touches[0].clientX - touch.current.lastX) * 0.01;
+        }
+        touch.current.lastX = e.touches[0].clientX;
+      }
+
+      if (touch.current.pinching && e.touches.length === 2) {
+        const dx = e.touches[0].clientX - e.touches[1].clientX;
+        const dy = e.touches[0].clientY - e.touches[1].clientY;
+        const dist = Math.hypot(dx, dy);
+        const ratio = dist / touch.current.lastDist;
+        const target = placed ? placedRef.current : null;
+        if (target) {
+          target.scale.setScalar(
+            THREE.MathUtils.clamp(target.scale.x * ratio, 0.1, 5)
+          );
+        }
+        touch.current.lastDist = dist;
+      }
+    },
+    [placed]
+  );
+
+  const onTouchEnd = useCallback(
+    (e: React.TouchEvent) => {
+      // Tap (no movement) → place
+      if (
+        touch.current.rotating &&
+        !touch.current.moved &&
+        e.changedTouches.length === 1
+      ) {
+        placeModel();
+      }
+      touch.current.rotating = false;
+      touch.current.pinching = false;
+    },
+    [placeModel]
+  );
 
   useEffect(() => {
     const cleanup = init();
-    return () => { cleanup.then((fn) => fn?.()); };
+    return () => {
+      cleanup.then((fn) => fn?.());
+    };
   }, [init]);
 
-  // ── Back-camera feed (getUserMedia) ──────────────────────────
+  // Back-camera feed
   useEffect(() => {
     let cancelled = false;
-
-    const start = async () => {
+    (async () => {
       if (!navigator.mediaDevices?.getUserMedia) {
         setCameraError("Camera API not available");
         return;
@@ -213,16 +290,12 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
         streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          // play() needs to be awaited on iOS; ignore AbortError on unmount.
           videoRef.current.play().catch(() => {});
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Camera blocked";
-        setCameraError(msg);
+        setCameraError(err instanceof Error ? err.message : "Camera blocked");
       }
-    };
-    start();
-
+    })();
     return () => {
       cancelled = true;
       streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -232,13 +305,12 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
 
   return (
     <div
-      ref={mountRef}
-      className="relative w-full h-dvh bg-black"
+      className="relative w-full h-dvh bg-black overflow-hidden"
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}
       onTouchEnd={onTouchEnd}
     >
-      {/* Live back-camera feed — sits behind the transparent Three.js canvas */}
+      {/* Back-camera passthrough */}
       <video
         ref={videoRef}
         autoPlay
@@ -246,24 +318,50 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
         muted
         className="absolute inset-0 w-full h-full object-cover"
       />
+
+      {/* Three.js canvas (transparent bg so video shows through) */}
       <canvas ref={canvasRef} className="absolute inset-0" />
 
-      {/* Crosshair centre indicator */}
-      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-        <div className="w-6 h-6 border-2 border-white/50 rounded-full" />
-      </div>
+      {/* ── Aiming crosshair ── */}
+      {!placed && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div className="relative w-20 h-20 flex items-center justify-center">
+            {/* Outer ring */}
+            <div className="absolute inset-0 rounded-full border-2 border-white/60" />
+            {/* Corner ticks */}
+            <div className="absolute top-0 left-1/2 -translate-x-1/2 w-px h-3 bg-white/80" />
+            <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-px h-3 bg-white/80" />
+            <div className="absolute left-0 top-1/2 -translate-y-1/2 h-px w-3 bg-white/80" />
+            <div className="absolute right-0 top-1/2 -translate-y-1/2 h-px w-3 bg-white/80" />
+            {/* Centre dot */}
+            <div className="w-1.5 h-1.5 rounded-full bg-yellow-400 shadow-[0_0_6px_2px_rgba(251,191,36,0.7)]" />
+          </div>
+        </div>
+      )}
 
-      {/* iOS permission prompt */}
+      {/* ── Placed indicator ── */}
+      {placed && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div className="w-4 h-4 flex items-center justify-center">
+            <div className="w-1.5 h-1.5 rounded-full bg-green-400/60" />
+          </div>
+        </div>
+      )}
+
+      {/* iOS motion permission overlay */}
       {needsPermission && !permissionGranted && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/70 z-20">
           <div className="bg-white/10 backdrop-blur rounded-2xl p-8 text-center max-w-xs mx-4">
-            <p className="text-white mb-4">Enable motion sensors for compass direction</p>
+            <p className="text-white mb-2 font-medium">Motion sensors needed</p>
+            <p className="text-white/60 text-sm mb-6">
+              The crosshair aims using your device orientation.
+            </p>
             <button
               onClick={async () => {
                 await requestPermission();
                 setNeedsPermission(false);
               }}
-              className="bg-yellow-500 text-black font-semibold px-6 py-2 rounded-full"
+              className="bg-yellow-400 text-black font-semibold px-6 py-2 rounded-full"
             >
               Enable
             </button>
@@ -271,17 +369,24 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
         </div>
       )}
 
-      {/* Status bar */}
-      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 text-center text-xs text-white/70 pointer-events-none space-y-1">
-        {cameraError && (
-          <p className="text-red-300/90">Camera: {cameraError}</p>
-        )}
-        {position ? (
-          <p>GPS locked · {position.accuracy.toFixed(0)} m accuracy</p>
+      {/* Re-place button */}
+      {placed && (
+        <button
+          className="absolute top-6 right-5 bg-black/40 backdrop-blur border border-white/20 text-white text-xs px-4 py-2 rounded-full z-10"
+          onClick={resetPlacement}
+        >
+          Re-place
+        </button>
+      )}
+
+      {/* Status / hint bar */}
+      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 w-max text-center text-xs text-white/70 pointer-events-none space-y-1">
+        {cameraError && <p className="text-red-300/90">Camera: {cameraError}</p>}
+        {placed ? (
+          <p>Drag to rotate · Pinch to scale</p>
         ) : (
-          <p>Acquiring GPS…</p>
+          <p>Aim at a spot and tap to place the lantern</p>
         )}
-        <p>Drag to rotate · Pinch to scale</p>
       </div>
     </div>
   );
