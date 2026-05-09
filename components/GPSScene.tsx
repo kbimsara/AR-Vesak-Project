@@ -14,8 +14,7 @@ interface GPSSceneProps {
 const MAX_PLACEMENT_DISTANCE = 20; // ray cap when not hitting the ground
 const MIN_PLACEMENT_DISTANCE = 0.8;
 const EYE_HEIGHT = 1.6;
-// Apparent-size scale: keeps the lantern visually the same size at any distance.
-// loadModel normalises to 0.4 m; factor 0.2 gives ~6° apparent height.
+// Apparent-size scale: keeps the lantern visually the same apparent size at any distance.
 const autoScale = (dist: number) => Math.max(0.5, dist * 0.2);
 
 export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
@@ -25,15 +24,14 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const ghostRef = useRef<THREE.Group | null>(null);
-  // Source of truth for new placements — clone synchronously on tap
+  // Source of truth for placements — clone synchronously on tap
   const templateRef = useRef<THREE.Group | null>(null);
-  // List of all placed models; activeRef always points to the last one
-  const placedListRef = useRef<THREE.Group[]>([]);
-  const activeRef = useRef<THREE.Group | null>(null);
+  // Single-placement: only one lantern at a time
+  const placedRef = useRef<THREE.Group | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const rafRef = useRef<number>(0);
 
-  const [placedCount, setPlacedCount] = useState(0);
+  const [hasPlaced, setHasPlaced] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const { orientation, permissionGranted, requestPermission } = useDeviceOrientation();
   const [needsPermission, setNeedsPermission] = useState(false);
@@ -51,9 +49,7 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
   // Where the user is actually pointing.
   // Cast a ray from the camera along the look direction:
   //   • If it hits the ground plane (y=0), drop the lantern there.
-  //   • Otherwise place it at MAX_PLACEMENT_DISTANCE along the ray.
-  // This makes tilting the phone down/up move the placement closer/further,
-  // matching what the crosshair is over.
+  //   • Otherwise place at MAX_PLACEMENT_DISTANCE along the ray.
   const crosshairWorldPos = useCallback((): THREE.Vector3 => {
     const cam = cameraRef.current;
     if (!cam) return new THREE.Vector3(0, 0, -MAX_PLACEMENT_DISTANCE);
@@ -61,12 +57,10 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
     let dist = MAX_PLACEMENT_DISTANCE;
 
-    // Pointing downward → intersect ground plane (y=0)
     if (dir.y < -0.02) {
       const groundDist = -cam.position.y / dir.y;
       if (groundDist > 0) dist = Math.min(dist, groundDist);
     }
-    // Don't let it spawn right on the lens
     dist = Math.max(MIN_PLACEMENT_DISTANCE, dist);
 
     return cam.position.clone().addScaledVector(dir, dist);
@@ -97,10 +91,8 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     dirLight.position.set(2, 5, 3);
     scene.add(dirLight);
 
-    // 60° vertical FOV is closer to typical phone rear cameras than 75°,
-    // which makes the on-screen crosshair point at (roughly) the same real
-    // direction as the video feed. Refined later from the video track if
-    // the browser reports it.
+    // 60° vertical FOV ≈ typical phone rear camera, so the on-screen
+    // crosshair points at (roughly) the same real direction as the video feed.
     const camera = new THREE.PerspectiveCamera(
       60,
       window.innerWidth / window.innerHeight,
@@ -114,7 +106,7 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     renderer.setClearAlpha(0);
     rendererRef.current = renderer;
 
-    // Template — kept un-mutated so placeModel can clone synchronously
+    // Template kept un-mutated so placeModel can clone synchronously
     const template = await loadModel(modelUrl);
     templateRef.current = template;
 
@@ -147,8 +139,7 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
         ghostRef.current.rotation.y = ghostRotY;
       }
 
-      // Idle rotation for every placed model
-      for (const m of placedListRef.current) m.rotation.y += 0.004;
+      if (placedRef.current) placedRef.current.rotation.y += 0.004;
 
       renderer.render(scene, camera);
     };
@@ -188,14 +179,16 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     }
   }, [permissionGranted]);
 
-  // Tap → add a new lantern at the crosshair position. Synchronous so the
-  // placement uses the camera quaternion as it was at the tap — no chance
-  // for orientation drift between tap and scene update.
+  // Tap → replace the lantern at the crosshair position. Synchronous so the
+  // placement uses the camera quaternion as it was at the tap.
   const placeModel = useCallback(() => {
     const scene = sceneRef.current;
     const camera = cameraRef.current;
     const template = templateRef.current;
     if (!scene || !camera || !template) return;
+
+    // Single-placement: remove the previous lantern if any
+    if (placedRef.current) scene.remove(placedRef.current);
 
     const pos = crosshairWorldPos();
     const model = template.clone();
@@ -204,7 +197,6 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     model.scale.setScalar(autoScale(dist));
     model.position.copy(pos);
 
-    // Face the model toward the camera on the horizontal plane
     const toCam = new THREE.Vector3()
       .subVectors(camera.position, pos)
       .setY(0);
@@ -214,22 +206,20 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     }
 
     scene.add(model);
-    placedListRef.current.push(model);
-    activeRef.current = model;
-    setPlacedCount((n) => n + 1);
+    placedRef.current = model;
+    setHasPlaced(true);
   }, [crosshairWorldPos]);
 
-  // Clear all placed lanterns
-  const clearAll = useCallback(() => {
+  const removePlacement = useCallback(() => {
     const scene = sceneRef.current;
-    if (!scene) return;
-    for (const m of placedListRef.current) scene.remove(m);
-    placedListRef.current = [];
-    activeRef.current = null;
-    setPlacedCount(0);
+    if (scene && placedRef.current) {
+      scene.remove(placedRef.current);
+      placedRef.current = null;
+    }
+    setHasPlaced(false);
   }, []);
 
-  // Touch handlers — drag/pinch target the most recently placed model
+  // Touch handlers — drag/pinch target the placed lantern
   const onTouchStart = useCallback((e: React.TouchEvent) => {
     if (e.touches.length === 1) {
       touch.current.startX = e.touches[0].clientX;
@@ -253,8 +243,8 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
       const dy = Math.abs(e.touches[0].clientY - touch.current.startY);
       if (dx > 6 || dy > 6) touch.current.moved = true;
 
-      if (activeRef.current) {
-        activeRef.current.rotation.y +=
+      if (placedRef.current) {
+        placedRef.current.rotation.y +=
           (e.touches[0].clientX - touch.current.lastX) * 0.01;
       }
       touch.current.lastX = e.touches[0].clientX;
@@ -264,10 +254,10 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       const dist = Math.hypot(dx, dy);
-      if (activeRef.current) {
+      if (placedRef.current) {
         const ratio = dist / touch.current.lastDist;
-        activeRef.current.scale.setScalar(
-          THREE.MathUtils.clamp(activeRef.current.scale.x * ratio, 0.1, 20)
+        placedRef.current.scale.setScalar(
+          THREE.MathUtils.clamp(placedRef.current.scale.x * ratio, 0.1, 20)
         );
       }
       touch.current.lastDist = dist;
@@ -340,7 +330,7 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
       />
       <canvas ref={canvasRef} className="absolute inset-0" />
 
-      {/* Crosshair — always visible so you can keep aiming */}
+      {/* Crosshair */}
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
         <div className="relative w-20 h-20 flex items-center justify-center">
           <div className="absolute inset-0 rounded-full border-2 border-white/60" />
@@ -352,20 +342,13 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
         </div>
       </div>
 
-      {/* Placed count badge */}
-      {placedCount > 0 && (
-        <div className="absolute top-6 left-5 bg-black/40 backdrop-blur border border-white/20 text-white text-xs px-3 py-1.5 rounded-full z-10 pointer-events-none">
-          🏮 {placedCount}
-        </div>
-      )}
-
-      {/* Clear all button */}
-      {placedCount > 0 && (
+      {/* Remove button */}
+      {hasPlaced && (
         <button
           className="absolute top-6 right-5 bg-black/40 backdrop-blur border border-white/20 text-white text-xs px-4 py-2 rounded-full z-10"
-          onClick={clearAll}
+          onClick={removePlacement}
         >
-          Clear all
+          Remove
         </button>
       )}
 
@@ -393,8 +376,8 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
       {/* Hint bar */}
       <div className="absolute bottom-8 left-1/2 -translate-x-1/2 w-max text-center text-xs text-white/70 pointer-events-none space-y-1">
         {cameraError && <p className="text-red-300/90">Camera: {cameraError}</p>}
-        {placedCount > 0 ? (
-          <p>Tap to add more · Drag/pinch last lantern</p>
+        {hasPlaced ? (
+          <p>Tap a new spot to move · Drag/pinch to adjust</p>
         ) : (
           <p>Aim at a spot and tap to place the lantern</p>
         )}

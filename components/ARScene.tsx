@@ -13,9 +13,7 @@ interface ARSceneProps {
   onUnsupported?: (reason: string) => void;
 }
 
-// Real-world size the placed lantern should appear.
-// loadModel normalises to a 0.4 m bounding box. Scale 1 = 40 cm
-// (real Vesak-lantern sized). Adjustable in-AR via the size buttons.
+// loadModel normalises to a 0.4 m bbox. Scale 1 → 40 cm (lantern-sized).
 const DEFAULT_PLACED_SCALE = 1;
 const MIN_PLACED_SCALE = 0.25;
 const MAX_PLACED_SCALE = 4;
@@ -25,12 +23,14 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
-  const placedListRef = useRef<THREE.Group[]>([]);
+  // Single-placement: only one lantern in the scene at a time
+  const placedRef = useRef<THREE.Group | null>(null);
 
   const [sessionState, setSessionState] = useState<"idle" | "starting" | "running">("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [placedCount, setPlacedCount] = useState(0);
-  // Current size for newly placed lanterns. Kept in a ref too so the XR
+  const [hasPlaced, setHasPlaced] = useState(false);
+
+  // Current size for the placed lantern. Mirrored in a ref so the XR
   // controller's `select` handler reads the latest value without re-binding.
   const [placeScale, setPlaceScale] = useState(DEFAULT_PLACED_SCALE);
   const placeScaleRef = useRef(DEFAULT_PLACED_SCALE);
@@ -70,7 +70,7 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
       setErrorMessage(
         `Model failed to load: ${err instanceof Error ? err.message : "unknown"}`
       );
-      onReady?.(); // unlock the UI so the button is visible
+      onReady?.();
       return;
     }
     onReady?.();
@@ -82,11 +82,13 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     controller.addEventListener("select", () => {
       if (!reticle.visible) return;
 
+      // Single-placement: remove the previous lantern if any
+      if (placedRef.current) scene.remove(placedRef.current);
+
       const model = modelTemplate.clone();
       model.scale.setScalar(placeScaleRef.current);
 
-      // Position from reticle, but keep upright (don't copy rotation so the
-      // lantern always stands vertically regardless of surface orientation)
+      // Position from reticle but stay upright (don't copy surface tilt)
       const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
       model.position.copy(pos);
 
@@ -100,8 +102,8 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
       }
 
       scene.add(model);
-      placedListRef.current.push(model);
-      setPlacedCount((n) => n + 1);
+      placedRef.current = model;
+      setHasPlaced(true);
     });
     scene.add(controller);
 
@@ -113,8 +115,8 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     window.addEventListener("resize", onResize);
 
     renderer.setAnimationLoop(async (_, frame) => {
-      // Idle rotation only on placed lanterns
-      for (const m of placedListRef.current) m.rotation.y += 0.005;
+      // Idle rotation on the placed lantern
+      if (placedRef.current) placedRef.current.rotation.y += 0.005;
 
       if (frame) {
         const session = renderer.xr.getSession()!;
@@ -135,6 +137,12 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
           session.addEventListener("end", () => {
             hitTestSourceRequested = false;
             hitTestSource = null;
+            // Reset placement state when session ends
+            if (placedRef.current && sceneRef.current) {
+              sceneRef.current.remove(placedRef.current);
+              placedRef.current = null;
+            }
+            setHasPlaced(false);
             setSessionState("idle");
           });
         }
@@ -200,7 +208,6 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
       setSessionState("running");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
-      // Log so the dev console shows the full error on the device
       console.error("[ARScene] requestSession failed", err);
       setErrorMessage(msg);
       setSessionState("idle");
@@ -208,28 +215,23 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     }
   }, [onUnsupported]);
 
-  const clearAll = useCallback(() => {
+  const removePlacement = useCallback(() => {
     const scene = sceneRef.current;
-    if (!scene) return;
-    for (const m of placedListRef.current) scene.remove(m);
-    placedListRef.current = [];
-    setPlacedCount(0);
+    if (!scene || !placedRef.current) return;
+    scene.remove(placedRef.current);
+    placedRef.current = null;
+    setHasPlaced(false);
   }, []);
 
-  // Update the chosen size; also resize the last-placed lantern live
-  // so users can dial it in without re-placing.
   const updateScale = useCallback((next: number) => {
     const clamped = Math.max(MIN_PLACED_SCALE, Math.min(MAX_PLACED_SCALE, next));
     placeScaleRef.current = clamped;
     setPlaceScale(clamped);
-    const last = placedListRef.current[placedListRef.current.length - 1];
-    if (last) last.scale.setScalar(clamped);
+    if (placedRef.current) placedRef.current.scale.setScalar(clamped);
   }, []);
 
   return (
     <div ref={mountRef} className="relative w-full h-dvh bg-black">
-      {/* Canvas is non-interactive until AR starts so it can never eat the
-          START AR button click on devices that mis-handle pointer events. */}
       <canvas
         ref={canvasRef}
         className={`absolute inset-0 ${
@@ -237,25 +239,19 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
         }`}
       />
 
-      {/* In-AR overlay (visible during the immersive session) */}
+      {/* In-AR overlay */}
       {sessionState === "running" && (
         <>
-          {placedCount > 0 && (
-            <div className="absolute top-6 left-5 bg-black/40 backdrop-blur border border-white/20 text-white text-xs px-3 py-1.5 rounded-full z-10 pointer-events-none">
-              🏮 {placedCount}
-            </div>
-          )}
-          {placedCount > 0 && (
+          {hasPlaced && (
             <button
-              onClick={clearAll}
+              onClick={removePlacement}
               className="absolute top-6 right-5 bg-black/40 backdrop-blur border border-white/20 text-white text-xs px-4 py-2 rounded-full z-10"
             >
-              Clear all
+              Remove
             </button>
           )}
 
-          {/* Size control — applies to the next placement AND resizes the
-              most recently placed lantern live. */}
+          {/* Size control — applies to the single placed lantern */}
           <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-10 flex items-center gap-3 bg-black/40 backdrop-blur border border-white/20 rounded-full px-3 py-2">
             <button
               onClick={() => updateScale(placeScale / 1.4)}
@@ -277,9 +273,9 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
           </div>
 
           <div className="absolute bottom-8 left-1/2 -translate-x-1/2 text-center text-xs text-white/80 pointer-events-none">
-            {placedCount === 0
-              ? "Move your phone to scan a surface, then tap to place"
-              : "Tap to add more · Use −/+ to resize"}
+            {hasPlaced
+              ? "Tap a new spot to move · Use −/+ to resize"
+              : "Move your phone to scan a surface, then tap to place"}
           </div>
         </>
       )}
