@@ -25,6 +25,8 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const ghostRef = useRef<THREE.Group | null>(null);
+  // Source of truth for new placements — clone synchronously on tap
+  const templateRef = useRef<THREE.Group | null>(null);
   // List of all placed models; activeRef always points to the last one
   const placedListRef = useRef<THREE.Group[]>([]);
   const activeRef = useRef<THREE.Group | null>(null);
@@ -95,8 +97,12 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     dirLight.position.set(2, 5, 3);
     scene.add(dirLight);
 
+    // 60° vertical FOV is closer to typical phone rear cameras than 75°,
+    // which makes the on-screen crosshair point at (roughly) the same real
+    // direction as the video feed. Refined later from the video track if
+    // the browser reports it.
     const camera = new THREE.PerspectiveCamera(
-      75,
+      60,
       window.innerWidth / window.innerHeight,
       0.01,
       1000
@@ -108,7 +114,12 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     renderer.setClearAlpha(0);
     rendererRef.current = renderer;
 
-    const ghost = await loadModel(modelUrl);
+    // Template — kept un-mutated so placeModel can clone synchronously
+    const template = await loadModel(modelUrl);
+    templateRef.current = template;
+
+    // Ghost preview = a separate clone with semi-transparent materials
+    const ghost = template.clone();
     ghost.scale.setScalar(autoScale(MAX_PLACEMENT_DISTANCE));
     applyGhostMaterial(ghost);
     ghostRef.current = ghost;
@@ -177,32 +188,36 @@ export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
     }
   }, [permissionGranted]);
 
-  // Tap → add a new lantern at the crosshair position
-  const placeModel = useCallback(async () => {
+  // Tap → add a new lantern at the crosshair position. Synchronous so the
+  // placement uses the camera quaternion as it was at the tap — no chance
+  // for orientation drift between tap and scene update.
+  const placeModel = useCallback(() => {
     const scene = sceneRef.current;
     const camera = cameraRef.current;
-    if (!scene || !camera) return;
+    const template = templateRef.current;
+    if (!scene || !camera || !template) return;
 
     const pos = crosshairWorldPos();
-    const model = await loadModel(modelUrl);
+    const model = template.clone();
 
-    // Auto-size: scale by actual distance from camera to the hit point
     const dist = pos.distanceTo(camera.position);
     model.scale.setScalar(autoScale(dist));
     model.position.copy(pos);
 
-    // Face model toward the camera on the horizontal plane
+    // Face the model toward the camera on the horizontal plane
     const toCam = new THREE.Vector3()
       .subVectors(camera.position, pos)
-      .setY(0)
-      .normalize();
-    model.rotation.y = Math.atan2(toCam.x, toCam.z);
+      .setY(0);
+    if (toCam.lengthSq() > 1e-6) {
+      toCam.normalize();
+      model.rotation.y = Math.atan2(toCam.x, toCam.z);
+    }
 
     scene.add(model);
     placedListRef.current.push(model);
     activeRef.current = model;
     setPlacedCount((n) => n + 1);
-  }, [crosshairWorldPos, modelUrl]);
+  }, [crosshairWorldPos]);
 
   // Clear all placed lanterns
   const clearAll = useCallback(() => {
