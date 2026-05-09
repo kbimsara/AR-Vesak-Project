@@ -56,7 +56,17 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     const reticle = createReticle();
     scene.add(reticle);
 
-    const modelTemplate = await loadModel(modelUrl);
+    let modelTemplate: THREE.Group;
+    try {
+      modelTemplate = await loadModel(modelUrl);
+    } catch (err) {
+      console.error("[ARScene] Failed to load model", err);
+      setErrorMessage(
+        `Model failed to load: ${err instanceof Error ? err.message : "unknown"}`
+      );
+      onReady?.(); // unlock the UI so the button is visible
+      return;
+    }
     onReady?.();
 
     let hitTestSource: XRHitTestSource | null = null;
@@ -156,8 +166,19 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
   }, [init]);
 
   const handleStartAR = useCallback(async () => {
+    if (!navigator.xr) {
+      setErrorMessage("WebXR not available in this browser");
+      return;
+    }
     const renderer = rendererRef.current;
-    if (!renderer || !navigator.xr) return;
+    if (!renderer) {
+      setErrorMessage("Renderer not ready yet — try again in a moment");
+      return;
+    }
+    if (!window.isSecureContext) {
+      setErrorMessage("WebXR requires HTTPS. Open the site over https://");
+      return;
+    }
 
     setSessionState("starting");
     setErrorMessage(null);
@@ -165,7 +186,7 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
     try {
       const session = await navigator.xr.requestSession("immersive-ar", {
         requiredFeatures: ["hit-test"],
-        optionalFeatures: ["dom-overlay"],
+        optionalFeatures: ["dom-overlay", "local-floor"],
         domOverlay: mountRef.current ? { root: mountRef.current } : undefined,
       } as XRSessionInit);
 
@@ -173,6 +194,8 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
       setSessionState("running");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
+      // Log so the dev console shows the full error on the device
+      console.error("[ARScene] requestSession failed", err);
       setErrorMessage(msg);
       setSessionState("idle");
       onUnsupported?.(msg);
@@ -188,8 +211,15 @@ export default function ARScene({ modelUrl, onReady, onUnsupported }: ARScenePro
   }, []);
 
   return (
-    <div ref={mountRef} className="relative w-full h-dvh">
-      <canvas ref={canvasRef} className="absolute inset-0" />
+    <div ref={mountRef} className="relative w-full h-dvh bg-black">
+      {/* Canvas is non-interactive until AR starts so it can never eat the
+          START AR button click on devices that mis-handle pointer events. */}
+      <canvas
+        ref={canvasRef}
+        className={`absolute inset-0 ${
+          sessionState === "running" ? "" : "pointer-events-none"
+        }`}
+      />
 
       {/* In-AR overlay (visible during the immersive session) */}
       {sessionState === "running" && (

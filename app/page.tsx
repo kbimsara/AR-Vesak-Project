@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useXRSupport } from "@/hooks/useXRSupport";
 import LoadingOverlay from "@/components/LoadingOverlay";
 import ModeIndicator from "@/components/ModeIndicator";
@@ -37,6 +37,13 @@ export default function Home() {
 
   const modeForIndicator = isWebXR ? "ar" : isIOSAR ? "ios-ar" : "gps";
 
+  // Stable refs so child scenes don't re-init on every parent render
+  const handleReady = useCallback(() => setModelReady(true), []);
+  const handleUnsupported = useCallback(() => {
+    setModelReady(false);
+    setArRuntimeFailed(true);
+  }, []);
+
   return (
     <main className="relative w-full h-dvh bg-black overflow-hidden">
       {/* Loading overlay — shown until mode is decided AND model is ready */}
@@ -51,25 +58,19 @@ export default function Home() {
       {!isChecking && isWebXR && (
         <ARScene
           modelUrl={MODEL_URL}
-          onReady={() => setModelReady(true)}
-          onUnsupported={() => {
-            setModelReady(false);
-            setArRuntimeFailed(true);
-          }}
+          onReady={handleReady}
+          onUnsupported={handleUnsupported}
         />
       )}
 
       {/* iOS AR Quick Look — iPhone / iPad */}
       {!isChecking && isIOSAR && (
-        <QuickLookLauncher
-          usdzUrl={USDZ_URL}
-          onReady={() => setModelReady(true)}
-        />
+        <QuickLookLauncher usdzUrl={USDZ_URL} onReady={handleReady} />
       )}
 
       {/* GPS fallback — desktop / unsupported devices */}
       {!isChecking && isGPS && (
-        <GPSScene modelUrl={MODEL_URL} onReady={() => setModelReady(true)} />
+        <GPSScene modelUrl={MODEL_URL} onReady={handleReady} />
       )}
     </main>
   );
