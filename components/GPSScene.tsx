@@ -11,7 +11,7 @@ interface GPSSceneProps {
   onReady?: () => void;
 }
 
-const PLACEMENT_DISTANCE = 2.5;
+const PLACEMENT_DISTANCE = 5;
 const EYE_HEIGHT = 1.6;
 const MODEL_SCALE = 2.5;
 
