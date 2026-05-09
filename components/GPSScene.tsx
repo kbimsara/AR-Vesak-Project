@@ -11,9 +11,9 @@ interface GPSSceneProps {
   onReady?: () => void;
 }
 
-const PLACEMENT_DISTANCE = 10;
+const PLACEMENT_DISTANCE = 20;
 const EYE_HEIGHT = 1.6;
-const MODEL_SCALE = 5;
+const MODEL_SCALE = 0.2;
 
 export default function GPSScene({ modelUrl, onReady }: GPSSceneProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
